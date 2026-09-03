@@ -665,6 +665,8 @@ export function PluginsConfig({
       });
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setLoading(false);
     }
   }, [cwd]);
 
