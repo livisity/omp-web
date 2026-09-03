@@ -89,6 +89,20 @@ async function loadModels(cwd: string): Promise<ModelsData> {
   for (const p of Object.keys(customProvidersData)) {
     authedProviderIds.add(p);
   }
+  // OAuth/API-key credentials persisted by pi's login flow live in auth.json,
+  // which getUsableOmpRuntimeCredentials (agent.db only) cannot see. Query the
+  // runtime auth status so OAuth providers (e.g. openai-codex / ChatGPT login)
+  // are not filtered out of the model picker after a successful login.
+  for (const m of available) {
+    if (authedProviderIds.has(m.provider)) continue;
+    try {
+      if (services.modelRuntime.getProviderAuthStatus(m.provider).configured) {
+        authedProviderIds.add(m.provider);
+      }
+    } catch {
+      // ignore per-provider status errors
+    }
+  }
   const ompConfig = readOmpConfig();
   const roles = ompConfig.modelRoles || {};
 
