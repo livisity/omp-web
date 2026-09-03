@@ -1,22 +1,26 @@
 "use client";
 
 /**
- * LibreChat/ChatGPT-style "quote to chat" selection layer.
+ * LibreChat/ChatGPT-style "quote to chat" selection layer, extended with a
+ * per-excerpt comment (评论) action.
  *
  * Watches document-level text selections; when a selection lives entirely
  * inside one rendered chat message (a `[data-omp-entry-id]` wrapper), a small
- * floating button appears near it. Activating the button pushes the excerpt
- * into the composer's pending-quote queue (rendered as removable chips above
- * the textarea and drained into the next outgoing message).
+ * floating pair of actions appears near it:
+ *   ❝ 引用  — queue the excerpt as-is
+ *   💬 评论 — open an inline input; the remark is attached to the excerpt and
+ *             sent together with it
+ * Excerpts land in the composer's pending-quote queue (removable chips above
+ * the textarea) and are drained into the next outgoing message / steer.
  *
  * Pointer and touch platforms surface selections differently: a mouse drag
  * ends in `mouseup`, while a long-press or native-handle drag (touch) emits
  * only `selectionchange` with no mouse event. Both paths are handled — mouse
  * selections show immediately, mouse-less ones after a short settle window —
- * so the button is reachable on phones as well as desktops.
+ * so the popup is reachable on phones as well as desktops.
  *
  * Rendered through a portal so `fixed` positioning stays viewport-relative
- * regardless of transformed ancestors; the position tracks the selection while
+ * regardless of transformed ancestors; positions track the selection while
  * the page scrolls instead of dismissing on the first scroll event.
  */
 
@@ -34,6 +38,8 @@ interface Props {
 
 /** Max characters captured per excerpt (defense against giant selections). */
 const MAX_QUOTE_LENGTH = 1500;
+/** Max characters for a user comment attached to an excerpt. */
+const MAX_COMMENT_LENGTH = 500;
 /** Vertical gap (px) between the selection and the popup. */
 const POPUP_OFFSET = 8;
 /** Keep the popup this far (px) from the viewport edges. */
@@ -50,6 +56,8 @@ interface SelectionInfo {
   anchor: AnchorRect;
   /** Touch selections carry an OS callout above them, so the popup goes below. */
   below: boolean;
+  /** Retained so scrolling can re-measure without re-walking the selection. */
+  range: Range;
 }
 
 function elementFromNode(node: Node | null): HTMLElement | null {
@@ -81,14 +89,40 @@ function anchorFromRange(range: Range): AnchorRect | null {
 const sameAnchor = (a: AnchorRect, b: AnchorRect): boolean =>
   a.top === b.top && a.bottom === b.bottom && a.left === b.left && a.right === b.right;
 
+/** Place a popup on the preferred side of the anchor, fallback + clamp. */
+function computePos(anchor: AnchorRect, el: HTMLElement, below: boolean): { left: number; top: number } {
+  const width = el.offsetWidth;
+  const height = el.offsetHeight;
+  const centerX = (anchor.left + anchor.right) / 2;
+  const left = Math.min(
+    Math.max(EDGE_MARGIN, centerX - width / 2),
+    Math.max(EDGE_MARGIN, window.innerWidth - width - EDGE_MARGIN),
+  );
+  const maxTop = Math.max(EDGE_MARGIN, window.innerHeight - height - EDGE_MARGIN);
+  const above = anchor.top - POPUP_OFFSET - height;
+  const under = anchor.bottom + POPUP_OFFSET;
+  const [preferred, fallback] = below ? [under, above] : [above, under];
+  let top = preferred;
+  if (top < EDGE_MARGIN || top > maxTop) top = fallback;
+  top = Math.min(Math.max(top, EDGE_MARGIN), maxTop);
+  return { left, top };
+}
+
+// useLayoutEffect warns during SSR; the popups only mount client-side anyway.
+const useIsoLayoutEffect = typeof window === "undefined" ? useEffect : useLayoutEffect;
+
 export function QuoteSelectionLayer({ containerRef, onQuote, disabled = false }: Props) {
   const { t } = useI18n();
   const [sel, setSel] = useState<SelectionInfo | null>(null);
+  const [commentFor, setCommentFor] = useState<SelectionInfo | null>(null);
+  const [commentText, setCommentText] = useState("");
   const selRef = useRef<SelectionInfo | null>(null);
-  const popupRef = useRef<HTMLButtonElement | null>(null);
-  /** Excerpt captured when a press begins, committed only if it completes on the button. */
-  const pressedRef = useRef<SelectionInfo | null>(null);
+  const commentRef = useRef<SelectionInfo | null>(null);
+  const popupRef = useRef<HTMLDivElement | null>(null);
+  const commentBoxRef = useRef<HTMLDivElement | null>(null);
+  const commentInputRef = useRef<HTMLTextAreaElement | null>(null);
   const [pos, setPos] = useState<{ left: number; top: number } | null>(null);
+  const [commentPos, setCommentPos] = useState<{ left: number; top: number } | null>(null);
   const belowRef = useRef(false);
 
   const publish = useCallback((next: SelectionInfo | null) => {
@@ -107,9 +141,14 @@ export function QuoteSelectionLayer({ containerRef, onQuote, disabled = false }:
   }, []);
 
   const hide = useCallback(() => {
-    pressedRef.current = null;
     publish(null);
   }, [publish]);
+
+  const closeComment = useCallback(() => {
+    commentRef.current = null;
+    setCommentFor(null);
+    setCommentText("");
+  }, []);
 
   const readSelection = useCallback((): SelectionInfo | null => {
     const container = containerRef.current;
@@ -131,7 +170,7 @@ export function QuoteSelectionLayer({ containerRef, onQuote, disabled = false }:
     const idxRaw = wrapper.getAttribute("data-omp-msg-index");
     const entryIndex = idxRaw !== null && idxRaw !== "" ? Number(idxRaw) : undefined;
     const text = raw.length > MAX_QUOTE_LENGTH ? `${raw.slice(0, MAX_QUOTE_LENGTH)}…` : raw;
-    return { quote: { text, entryId, entryIndex }, anchor, below: belowRef.current };
+    return { quote: { text, entryId, entryIndex }, anchor, below: belowRef.current, range };
   }, [containerRef]);
 
   // Selection lifecycle: mouse paths show on mouseup, mouse-less paths settle.
@@ -171,8 +210,11 @@ export function QuoteSelectionLayer({ containerRef, onQuote, disabled = false }:
     const onPointerDown = (e: PointerEvent) => {
       belowRef.current = e.pointerType !== "mouse";
       mouseDragging = e.pointerType === "mouse";
-      if (popupRef.current && e.target instanceof Node && popupRef.current.contains(e.target)) return;
+      const target = e.target instanceof Node ? e.target : null;
+      if (target && popupRef.current?.contains(target)) return;
+      if (target && commentBoxRef.current?.contains(target)) return;
       hide();
+      closeComment();
     };
     const onMouseUp = () => {
       mouseDragging = false;
@@ -181,9 +223,22 @@ export function QuoteSelectionLayer({ containerRef, onQuote, disabled = false }:
     // Reposition while scrolling (capture: the chat list scrolls itself).
     const onReflow = () => {
       if (selRef.current) show();
+      const open = commentRef.current;
+      if (open) {
+        const anchor = anchorFromRange(open.range);
+        if (!anchor) {
+          closeComment();
+        } else {
+          const next: SelectionInfo = sameAnchor(open.anchor, anchor) ? open : { ...open, anchor };
+          setCommentFor(next);
+        }
+      }
     };
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") hide();
+      if (e.key === "Escape") {
+        hide();
+        closeComment();
+      }
     };
 
     document.addEventListener("selectionchange", onSelectionChange);
@@ -201,101 +256,253 @@ export function QuoteSelectionLayer({ containerRef, onQuote, disabled = false }:
       window.removeEventListener("resize", onReflow);
       document.removeEventListener("keydown", onKeyDown);
     };
-  }, [disabled, hide, publish, readSelection]);
+  }, [disabled, hide, publish, readSelection, closeComment]);
 
-  // Keep a ref in sync for event handlers, and drop stale press state.
+  // Keep a ref in sync for event handlers.
   useEffect(() => {
     selRef.current = sel;
-    if (!sel) pressedRef.current = null;
   }, [sel]);
 
-  // Measure + position: prefer above the selection, fallback below, clamped.
-  useLayoutEffect(() => {
+  // Measure + position both popups (prefer above the selection, fallback below).
+  useIsoLayoutEffect(() => {
     if (!sel || !popupRef.current) {
       setPos(null);
       return;
     }
-    const width = popupRef.current.offsetWidth;
-    const height = popupRef.current.offsetHeight;
-    const centerX = (sel.anchor.left + sel.anchor.right) / 2;
-    const left = Math.min(
-      Math.max(EDGE_MARGIN, centerX - width / 2),
-      Math.max(EDGE_MARGIN, window.innerWidth - width - EDGE_MARGIN),
-    );
-    const maxTop = Math.max(EDGE_MARGIN, window.innerHeight - height - EDGE_MARGIN);
-    const above = sel.anchor.top - POPUP_OFFSET - height;
-    const below = sel.anchor.bottom + POPUP_OFFSET;
-    const [preferred, fallback] = sel.below ? [below, above] : [above, below];
-    let top = preferred;
-    if (top < EDGE_MARGIN || top > maxTop) top = fallback;
-    top = Math.min(Math.max(top, EDGE_MARGIN), maxTop);
-    setPos({ left, top });
+    setPos(computePos(sel.anchor, popupRef.current, sel.below));
   }, [sel]);
 
-  const commit = useCallback(
-    (cap: SelectionInfo) => {
-      onQuote(cap.quote);
-      publish(null);
-      try {
-        window.getSelection()?.removeAllRanges();
-      } catch {
-        // ignore
-      }
-    },
-    [onQuote, publish],
-  );
+  useIsoLayoutEffect(() => {
+    if (!commentFor || !commentBoxRef.current) {
+      setCommentPos(null);
+      return;
+    }
+    setCommentPos(computePos(commentFor.anchor, commentBoxRef.current, commentFor.below));
+  }, [commentFor]);
 
-  if (!sel || typeof document === "undefined") return null;
+  const commitQuote = useCallback(() => {
+    const cap = selRef.current;
+    if (!cap) return;
+    onQuote(cap.quote);
+    hide();
+    try {
+      window.getSelection()?.removeAllRanges();
+    } catch {
+      // ignore
+    }
+  }, [onQuote, hide]);
 
-  const style: React.CSSProperties = {
+  const startComment = useCallback(() => {
+    const cap = selRef.current;
+    if (!cap) return;
+    commentRef.current = cap;
+    setCommentFor(cap);
+    setCommentText("");
+    publish(null); // hide the action row; the comment box takes over
+    requestAnimationFrame(() => commentInputRef.current?.focus());
+  }, [publish]);
+
+  const confirmComment = useCallback(() => {
+    const cap = commentRef.current;
+    if (!cap) return;
+    const comment = commentText.trim().slice(0, MAX_COMMENT_LENGTH);
+    onQuote({ ...cap.quote, comment: comment || undefined });
+    closeComment();
+    try {
+      window.getSelection()?.removeAllRanges();
+    } catch {
+      // ignore
+    }
+  }, [commentText, onQuote, closeComment]);
+
+  const popupStyle: React.CSSProperties = {
     position: "fixed",
     left: pos?.left ?? -9999,
     top: pos?.top ?? -9999,
     visibility: pos ? "visible" : "hidden",
     zIndex: 1000,
+    display: "flex",
+    alignItems: "stretch",
+    gap: 2,
+    padding: 3,
+    borderRadius: 10,
+    border: "1px solid color-mix(in srgb, var(--border) 70%, transparent)",
+    background: "var(--bg-panel, var(--bg))",
+    boxShadow: "0 4px 16px -4px rgba(15,23,42,0.18)",
+  };
+
+  const actionStyle: React.CSSProperties = {
     display: "inline-flex",
     alignItems: "center",
     gap: 6,
     padding: "6px 12px",
-    borderRadius: 10,
-    border: "1px solid color-mix(in srgb, var(--border) 70%, transparent)",
-    background: "var(--bg-panel, var(--bg))",
+    borderRadius: 7,
+    border: "none",
+    background: "none",
     color: "var(--text)",
     fontSize: 13,
     lineHeight: 1,
-    boxShadow: "0 4px 16px -4px rgba(15,23,42,0.18)",
     cursor: "pointer",
+    whiteSpace: "nowrap",
   };
 
-  return createPortal(
-    <button
-      ref={popupRef}
-      type="button"
-      style={style}
-      title={t("chat.quoteAdd")}
-      aria-label={t("chat.quoteAdd")}
-      onPointerDown={(e) => {
-        // Preserve the live selection on mouse; touch captures at press start.
-        if (e.pointerType === "mouse") e.preventDefault();
-        pressedRef.current = selRef.current;
-      }}
-      onPointerUp={(e) => {
-        const cap = pressedRef.current;
-        pressedRef.current = null;
-        if (cap && e.currentTarget.contains(e.target as Node)) commit(cap);
-      }}
-      onKeyDown={(e) => {
-        if (e.key === "Enter" || e.key === " ") {
-          e.preventDefault();
-          commit(sel);
-        }
-      }}
-    >
-      <span aria-hidden style={{ fontSize: 14, lineHeight: 1 }}>
-        ❝
-      </span>
-      {t("chat.quoteAdd")}
-    </button>,
-    document.body,
+  return (
+    <>
+      {sel && !commentFor && typeof document !== "undefined"
+        ? createPortal(
+            <div
+              ref={popupRef}
+              style={popupStyle}
+              onPointerDown={(e) => {
+                // Preserve the live selection on mouse (suppresses focus/selection clearing).
+                if (e.pointerType === "mouse") e.preventDefault();
+              }}
+            >
+              <button
+                type="button"
+                style={actionStyle}
+                title={t("chat.quoteAdd")}
+                onPointerUp={(e) => {
+                  if (e.currentTarget.contains(e.target as Node)) commitQuote();
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    commitQuote();
+                  }
+                }}
+              >
+                <span aria-hidden style={{ fontSize: 14, lineHeight: 1 }}>
+                  ❝
+                </span>
+                {t("chat.quoteAdd")}
+              </button>
+              <span aria-hidden style={{ width: 1, background: "var(--border)", margin: "2px 0" }} />
+              <button
+                type="button"
+                style={actionStyle}
+                title={t("chat.commentAdd")}
+                onPointerUp={(e) => {
+                  if (e.currentTarget.contains(e.target as Node)) startComment();
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    startComment();
+                  }
+                }}
+              >
+                <span aria-hidden style={{ fontSize: 13, lineHeight: 1 }}>
+                  💬
+                </span>
+                {t("chat.commentAdd")}
+              </button>
+            </div>,
+            document.body,
+          )
+        : null}
+
+      {commentFor && typeof document !== "undefined"
+        ? createPortal(
+            <div
+              ref={commentBoxRef}
+              style={{
+                position: "fixed",
+                left: commentPos?.left ?? -9999,
+                top: commentPos?.top ?? -9999,
+                visibility: commentPos ? "visible" : "hidden",
+                zIndex: 1000,
+                width: 320,
+                maxWidth: `calc(100vw - ${EDGE_MARGIN * 2}px)`,
+                padding: 10,
+                borderRadius: 10,
+                border: "1px solid color-mix(in srgb, var(--border) 70%, transparent)",
+                background: "var(--bg-panel, var(--bg))",
+                boxShadow: "0 8px 24px -8px rgba(15,23,42,0.25)",
+              }}
+            >
+              <div style={{ fontSize: 11, color: "var(--text-dim)", marginBottom: 6 }}>
+                💬 {t("chat.commentAdd")}
+              </div>
+              <div
+                style={{
+                  maxHeight: 72,
+                  overflowY: "auto",
+                  padding: "4px 8px",
+                  marginBottom: 6,
+                  borderRadius: 6,
+                  background: "color-mix(in srgb, var(--border) 25%, transparent)",
+                  fontSize: 11,
+                  color: "var(--text-muted)",
+                  lineHeight: 1.5,
+                }}
+              >
+                {commentFor.quote.text}
+              </div>
+              <textarea
+                ref={commentInputRef}
+                value={commentText}
+                maxLength={MAX_COMMENT_LENGTH}
+                placeholder={t("chat.commentPlaceholder")}
+                rows={3}
+                onChange={(e) => setCommentText(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    confirmComment();
+                  }
+                }}
+                style={{
+                  width: "100%",
+                  boxSizing: "border-box",
+                  resize: "none",
+                  border: "1px solid color-mix(in srgb, var(--border) 70%, transparent)",
+                  borderRadius: 6,
+                  background: "var(--bg)",
+                  color: "var(--text)",
+                  fontSize: 12,
+                  lineHeight: 1.5,
+                  padding: "6px 8px",
+                  outline: "none",
+                }}
+              />
+              <div style={{ display: "flex", justifyContent: "flex-end", gap: 6, marginTop: 6 }}>
+                <button
+                  type="button"
+                  onClick={closeComment}
+                  style={{
+                    border: "1px solid color-mix(in srgb, var(--border) 70%, transparent)",
+                    background: "none",
+                    color: "var(--text-muted)",
+                    fontSize: 12,
+                    padding: "4px 10px",
+                    borderRadius: 6,
+                    cursor: "pointer",
+                  }}
+                >
+                  {t("chat.quoteCancel")}
+                </button>
+                <button
+                  type="button"
+                  onClick={confirmComment}
+                  style={{
+                    border: "none",
+                    background: "var(--accent, #2563eb)",
+                    color: "#fff",
+                    fontSize: 12,
+                    padding: "4px 10px",
+                    borderRadius: 6,
+                    cursor: "pointer",
+                  }}
+                >
+                  {t("chat.quoteConfirm")}
+                </button>
+              </div>
+            </div>,
+            document.body,
+          )
+        : null}
+    </>
   );
 }

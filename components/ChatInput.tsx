@@ -560,14 +560,19 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
   }, [setQuotesSynced]);
 
   /** Prepend drained quotes as blockquotes so the model sees exactly which
-   *  spans the question is about; typed text follows after a blank line. */
+   *  spans the question is about; a user comment (评论) rides inside the same
+   *  block as a 💬 line; typed text follows after a blank line. */
   const composeWithQuotes = useCallback((typed: string, list: PendingQuote[]): string => {
     if (!list.length) return typed;
     const block = list
-      .map((q) => q.text.split("\n").map((line) => `> ${line}`).join("\n"))
+      .map((q) => {
+        const lines = q.text.split("\n").map((line) => `> ${line}`);
+        if (q.comment) lines.push(`> 💬 ${t("chat.commentLabel")}${q.comment}`);
+        return lines.join("\n");
+      })
       .join("\n\n");
     return typed ? `${block}\n\n${typed}` : block;
-  }, []);
+  }, [t]);
 
   useEffect(() => {
     if (!draftKey || draftKeyRef.current !== draftKey) return;
@@ -1703,9 +1708,22 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                     lineHeight: 1.4,
                   }}
                 >
-                  <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 360 }}>
+                  <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 220 }}>
                     ❝ {q.text}
                   </span>
+                  {q.comment && (
+                    <span
+                      style={{
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                        whiteSpace: "nowrap",
+                        maxWidth: 220,
+                        color: "var(--accent, #2563eb)",
+                      }}
+                    >
+                      💬 {q.comment}
+                    </span>
+                  )}
                   <button
                     type="button"
                     onClick={() => setQuotesSynced((prev) => prev.filter((item) => item.id !== q.id))}

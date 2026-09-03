@@ -9,6 +9,8 @@ export interface QuoteDraft {
   /** Session entry the excerpt came from, when known. */
   entryId?: string;
   entryIndex?: number;
+  /** User remark attached to the excerpt (评论) — sent alongside it. */
+  comment?: string;
 }
 
 /** A pending quote queued in the composer (QuoteDraft + stable key). */
