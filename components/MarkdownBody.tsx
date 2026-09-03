@@ -44,6 +44,20 @@ export function MarkdownBody({ children, className, isStreaming, cwd, onOpenFile
     a({ href, children, ...props }) {
       // `node` is react-markdown metadata, not a DOM attribute.
       delete props.node;
+      // Inline badge replacing a :codex-annotation{index="N"} directive —
+      // dead anchor; tooltip (title) carries the selected text + user comment.
+      if (href?.startsWith("#omp-annotation-")) {
+        const { title, ...rest } = props as typeof props & { title?: string };
+        return (
+          <span
+            className="omp-annotation-badge"
+            title={typeof title === "string" ? title : undefined}
+            {...rest}
+          >
+            {children}
+          </span>
+        );
+      }
       const filePath = onOpenFile ? resolveLocalFileHref(href, cwd) : null;
       const openFile = onOpenFile;
       if (!filePath || !openFile) {

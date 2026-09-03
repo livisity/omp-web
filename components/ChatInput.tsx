@@ -5,6 +5,7 @@ import { PI_CLI_BUILTIN_SLASH_COMMANDS } from "@/lib/pi-slash-commands";
 import type { BuiltinSlashCommandResult, CompactResultInfo, QueuedMessages, SlashCommandInfo } from "@/hooks/useAgentSession";
 import type { SkillsResponse } from "@/lib/api-types";
 import { clearDraft, getDraft, setDraft, type ChatDraftImage, type PendingQuote, type QuoteDraft } from "@/lib/draft-store";
+import { buildAnnotationsEnvelope } from "@/lib/response-annotations";
 import {
   MAX_ATTACHED_IMAGE_BYTES,
   MAX_ATTACHED_IMAGES,
@@ -559,20 +560,13 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
     return list;
   }, [setQuotesSynced]);
 
-  /** Prepend drained quotes as blockquotes so the model sees exactly which
-   *  spans the question is about; a user comment (评论) rides inside the same
-   *  block as a 💬 line; typed text follows after a blank line. */
+  /** Prepend the Codex-style annotations envelope: quotes (+ comments) as a
+   *  structured JSON payload the model can reference by index; typed text
+   *  follows after `## My request:`. */
   const composeWithQuotes = useCallback((typed: string, list: PendingQuote[]): string => {
     if (!list.length) return typed;
-    const block = list
-      .map((q) => {
-        const lines = q.text.split("\n").map((line) => `> ${line}`);
-        if (q.comment) lines.push(`> 💬 ${t("chat.commentLabel")}${q.comment}`);
-        return lines.join("\n");
-      })
-      .join("\n\n");
-    return typed ? `${block}\n\n${typed}` : block;
-  }, [t]);
+    return buildAnnotationsEnvelope(list, typed);
+  }, []);
 
   useEffect(() => {
     if (!draftKey || draftKeyRef.current !== draftKey) return;

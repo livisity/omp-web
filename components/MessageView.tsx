@@ -1,6 +1,7 @@
 "use client";
 
-import { memo, useState, useRef, useEffect, useMemo } from "react";
+import { memo, useState, useRef, useEffect, useMemo, createContext, useContext } from "react";
+import { parseAnnotationsEnvelope, renderAnnotationDirectives, type ResponseAnnotation } from "@/lib/response-annotations";
 import { MarkdownBody } from "./MarkdownBody";
 import { copyText } from "@/lib/clipboard";
 import { useI18n } from "@/hooks/useI18n";
@@ -69,6 +70,9 @@ interface Props {
   showTimestamp?: boolean;
   prevTimestamp?: number;
   sessionId?: string;
+  /** Annotations parsed from the envelope of the user message that triggered
+   *  this assistant reply — used to render inline `:codex-annotation` badges. */
+  responseAnnotations?: ResponseAnnotation[];
 }
 
 function formatTime(ts?: number): string | null {
@@ -98,12 +102,19 @@ function haveSameRelevantToolResults(
   return true;
 }
 
-export const MessageView = memo(function MessageView({ message, isStreaming, toolResults, modelNames, cwd, onOpenFile, entryId, onFork, forking, onNavigate, prevAssistantEntryId, onEditContent, showTimestamp, prevTimestamp, sessionId }: Props) {
+/** Annotations for the reply currently being rendered (TextBlock consumes). */
+const ResponseAnnotationsContext = createContext<ResponseAnnotation[] | undefined>(undefined);
+
+export const MessageView = memo(function MessageView({ message, isStreaming, toolResults, modelNames, cwd, onOpenFile, entryId, onFork, forking, onNavigate, prevAssistantEntryId, onEditContent, showTimestamp, prevTimestamp, sessionId, responseAnnotations }: Props) {
   if (message.role === "user") {
     return <UserMessageView message={message as UserMessage} cwd={cwd} onOpenFile={onOpenFile} entryId={entryId} onFork={onFork} forking={forking} onNavigate={onNavigate} prevAssistantEntryId={prevAssistantEntryId} onEditContent={onEditContent} />;
   }
   if (message.role === "assistant") {
-    return <AssistantMessageView message={message as AssistantMessage} isStreaming={isStreaming} toolResults={toolResults} modelNames={modelNames} cwd={cwd} onOpenFile={onOpenFile} showTimestamp={showTimestamp} prevTimestamp={prevTimestamp} sessionId={sessionId} entryId={entryId} />;
+    return (
+      <ResponseAnnotationsContext.Provider value={responseAnnotations}>
+        <AssistantMessageView message={message as AssistantMessage} isStreaming={isStreaming} toolResults={toolResults} modelNames={modelNames} cwd={cwd} onOpenFile={onOpenFile} showTimestamp={showTimestamp} prevTimestamp={prevTimestamp} sessionId={sessionId} entryId={entryId} />
+      </ResponseAnnotationsContext.Provider>
+    );
   }
   if (message.role === "toolResult") {
     // Rendered inline under its toolCall — skip standalone rendering if paired
@@ -134,7 +145,8 @@ export const MessageView = memo(function MessageView({ message, isStreaming, too
     && prev.onEditContent === next.onEditContent
     && prev.showTimestamp === next.showTimestamp
     && prev.prevTimestamp === next.prevTimestamp
-    && prev.sessionId === next.sessionId;
+    && prev.sessionId === next.sessionId
+    && prev.responseAnnotations === next.responseAnnotations;
 });
 
 function UserMessageView({ message, cwd, onOpenFile, entryId, onFork, forking, onNavigate, prevAssistantEntryId, onEditContent }: {
@@ -159,6 +171,9 @@ function UserMessageView({ message, cwd, onOpenFile, entryId, onFork, forking, o
           .filter((b): b is TextContent => b.type === "text")
           .map((b) => b.text)
           .join("\n");
+
+  // Codex-style annotations envelope → quote/comment cards + typed request.
+  const parsedAnnotations = useMemo(() => parseAnnotationsEnvelope(content), [content]);
 
   const imageBlocks: ImageContent[] =
     typeof message.content === "string"
@@ -223,7 +238,49 @@ function UserMessageView({ message, cwd, onOpenFile, entryId, onFork, forking, o
               })}
             </div>
           )}
-          {content && <MarkdownBody className="markdown-user-message" cwd={cwd} onOpenFile={onOpenFile}>{content}</MarkdownBody>}
+          {parsedAnnotations ? (
+            <>
+              <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: parsedAnnotations.requestText ? 8 : 0 }}>
+                {parsedAnnotations.annotations.map((annotation, i) => (
+                  <div
+                    key={i}
+                    style={{
+                      border: "1px solid rgba(59,130,246,0.25)",
+                      borderRadius: 8,
+                      padding: "6px 8px",
+                      background: "rgba(59,130,246,0.06)",
+                      fontSize: 12,
+                      lineHeight: 1.5,
+                    }}
+                  >
+                    <div style={{ color: "var(--text-dim)", fontSize: 10, marginBottom: 2 }}>
+                      {t("chat.annotationBadge", { n: i + 1 })} · {t("chat.annotationSelected")}
+                    </div>
+                    <div style={{ whiteSpace: "pre-wrap", wordBreak: "break-word", maxHeight: 120, overflowY: "auto" }}>
+                      {annotation.text}
+                    </div>
+                    {annotation.annotation && (
+                      <>
+                        <div style={{ color: "var(--text-dim)", fontSize: 10, margin: "4px 0 2px" }}>
+                          {t("chat.annotationComment")}
+                        </div>
+                        <div style={{ whiteSpace: "pre-wrap", wordBreak: "break-word", color: "var(--text)" }}>
+                          {annotation.annotation}
+                        </div>
+                      </>
+                    )}
+                  </div>
+                ))}
+              </div>
+              {parsedAnnotations.requestText && (
+                <MarkdownBody className="markdown-user-message" cwd={cwd} onOpenFile={onOpenFile}>
+                  {parsedAnnotations.requestText}
+                </MarkdownBody>
+              )}
+            </>
+          ) : (
+            content && <MarkdownBody className="markdown-user-message" cwd={cwd} onOpenFile={onOpenFile}>{content}</MarkdownBody>
+          )}
         </div>
 
       </div>
@@ -621,7 +678,19 @@ function BlockView({ block, toolResults, isStreaming, streamingDuration, toolCal
 }
 
 function TextBlock({ block, isStreaming, cwd, onOpenFile }: { block: TextContent; isStreaming?: boolean; cwd?: string; onOpenFile?: (filePath: string) => void }) {
-  return <MarkdownBody isStreaming={isStreaming} cwd={cwd} onOpenFile={onOpenFile}>{block.text}</MarkdownBody>;
+  const { t } = useI18n();
+  const annotations = useContext(ResponseAnnotationsContext);
+  const text = useMemo(
+    () =>
+      renderAnnotationDirectives(block.text, annotations, {
+        badge: (n) => t("chat.annotationBadge", { n }),
+        tooltip: (annotation, n) =>
+          `${t("chat.annotationBadge", { n })} · ${t("chat.annotationSelected")}: ${annotation.text}` +
+          (annotation.annotation ? ` | ${t("chat.annotationComment")}: ${annotation.annotation}` : ""),
+      }),
+    [block.text, annotations, t],
+  );
+  return <MarkdownBody isStreaming={isStreaming} cwd={cwd} onOpenFile={onOpenFile}>{text}</MarkdownBody>;
 }
 
 function ThinkingBlock({ block, duration, sessionId, entryId, blockIndex }: {

@@ -8,6 +8,7 @@ import { countToolCallBlocks, getAssistantErrorMessage, getDisplayableAssistantB
 import { MessageView } from "./MessageView";
 import { QuoteSelectionLayer } from "./QuoteSelectionLayer";
 import type { QuoteDraft } from "@/lib/draft-store";
+import { parseAnnotationsEnvelope, type ResponseAnnotation } from "@/lib/response-annotations";
 import { ChatInput, type ChatInputHandle } from "./ChatInput";
 import { ChatMinimap, useMessageRefs } from "./ChatMinimap";
 import { ExtensionStatusBar } from "./ExtensionStatusBar";
@@ -231,6 +232,32 @@ export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreate
     soundedExtensionDialogIdRef.current = extensionDialog.id;
     playDoneSoundRef.current();
   }, [extensionDialog]);
+
+  // Annotations from the nearest preceding user envelope, per message index.
+  // Index `messages.length` covers the live streaming message.
+  const responseAnnotationsByIdx = useMemo(() => {
+    const map = new Map<number, ResponseAnnotation[] | undefined>();
+    for (let idx = 0; idx <= messages.length; idx++) {
+      for (let i = idx - 1; i >= 0; i--) {
+        const m = messages[i];
+        if (m.role !== "user") continue;
+        const content =
+          typeof m.content === "string"
+            ? m.content
+            : m.content
+                .filter((b): b is { type: "text"; text: string } => b.type === "text")
+                .map((b) => b.text)
+                .join("\n");
+        map.set(idx, parseAnnotationsEnvelope(content)?.annotations);
+        break;
+      }
+    }
+    return map;
+  }, [messages]);
+  const responseAnnotationsFor = useCallback(
+    (idx: number) => responseAnnotationsByIdx.get(idx),
+    [responseAnnotationsByIdx],
+  );
 
   // Register the abort handler for the global Esc shortcut
   useEffect(() => {
@@ -592,6 +619,7 @@ export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreate
                     showTimestamp={showTimestamp}
                     prevTimestamp={idx > 0 ? (messages[idx - 1] as AgentMessage & { timestamp?: number }).timestamp : undefined}
                     sessionId={session?.id ?? sessionIdRef.current ?? undefined}
+                    responseAnnotations={responseAnnotationsFor(idx)}
                   />
                 );
                 if (!isVisible || options.attachRef === false || currentRefIdx === undefined) return view;
@@ -702,7 +730,7 @@ export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreate
               );
             })()}
             {streamState.isStreaming && streamState.streamingMessage && (
-              <MessageView message={streamState.streamingMessage as AgentMessage} isStreaming modelNames={modelNames} cwd={messageCwd} onOpenFile={onOpenFile} />
+              <MessageView message={streamState.streamingMessage as AgentMessage} isStreaming modelNames={modelNames} cwd={messageCwd} onOpenFile={onOpenFile} responseAnnotations={responseAnnotationsFor(messages.length)} />
             )}
 
             {agentRunning && !streamState.streamingMessage && agentPhase && (
