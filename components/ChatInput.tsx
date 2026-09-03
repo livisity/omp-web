@@ -4,7 +4,7 @@ import React, { useRef, useState, useCallback, useEffect, useImperativeHandle, f
 import { PI_CLI_BUILTIN_SLASH_COMMANDS } from "@/lib/pi-slash-commands";
 import type { BuiltinSlashCommandResult, CompactResultInfo, QueuedMessages, SlashCommandInfo } from "@/hooks/useAgentSession";
 import type { SkillsResponse } from "@/lib/api-types";
-import { clearDraft, getDraft, setDraft, type ChatDraftImage } from "@/lib/draft-store";
+import { clearDraft, getDraft, setDraft, type ChatDraftImage, type PendingQuote, type QuoteDraft } from "@/lib/draft-store";
 import {
   MAX_ATTACHED_IMAGE_BYTES,
   MAX_ATTACHED_IMAGES,
@@ -77,11 +77,15 @@ export interface ChatInputHandle {
   insertIfEmpty: (text: string) => void;
   prependText: (text: string) => void;
   addImages: (files: File[]) => void;
+  /** Queue a quoted excerpt (shown as a chip; drained into the next send). */
+  addQuote: (quote: QuoteDraft) => void;
+  clearQuotes: () => void;
 }
 
 const TOOL_PRESETS = ["off", "default", "full"] as const;
 const TOOL_PRESET_MAP: Record<"off" | "default" | "full", "none" | "default" | "full"> = { off: "none", default: "default", full: "full" };
 const COMPOSITION_END_ENTER_GRACE_MS = 100;
+const MAX_PENDING_QUOTES = 10;
 const PROVIDER_NAMES: Record<string, string> = {
   "google-antigravity": "Google AntiGravity-login",
   "github-copilot": "GitHub Copilot",
@@ -359,6 +363,15 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
   const [attachedImages, setAttachedImages] = useState<AttachedImage[]>(() => (
     draftKey ? draftImagesToAttachedImages(getDraft(draftKey)?.images) : []
   ));
+  const [quotes, setQuotes] = useState<PendingQuote[]>(() => (draftKey ? getDraft(draftKey)?.quotes ?? [] : []));
+  const quotesRef = useRef(quotes);
+  const setQuotesSynced = useCallback((next: PendingQuote[] | ((prev: PendingQuote[]) => PendingQuote[])) => {
+    setQuotes((prev) => {
+      const updated = typeof next === "function" ? next(prev) : next;
+      quotesRef.current = updated;
+      return updated;
+    });
+  }, []);
   const trimmedValue = value.trimStart();
   const bashMode = attachedImages.length === 0 && trimmedValue.startsWith("!");
   const bashExcluded = bashMode && trimmedValue.startsWith("!!");
@@ -460,6 +473,17 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
     addImages(files: File[]) {
       processImageFiles(files);
     },
+    addQuote(quote: QuoteDraft) {
+      if (!quote.text.trim()) return;
+      setQuotesSynced((prev) => (
+        prev.length >= MAX_PENDING_QUOTES
+          ? prev
+          : [...prev, { ...quote, id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}` }]
+      ));
+    },
+    clearQuotes() {
+      setQuotesSynced([]);
+    },
   }));
 
   const processImageFiles = useCallback(async (files: File[]) => {
@@ -528,13 +552,31 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
     }
   }, [clearImages, draftKey]);
 
+  /** Atomic read + reset of the pending quote queue (mirrors LibreChat's drain). */
+  const drainQuotes = useCallback((): PendingQuote[] => {
+    const list = quotesRef.current;
+    if (list.length) setQuotesSynced([]);
+    return list;
+  }, [setQuotesSynced]);
+
+  /** Prepend drained quotes as blockquotes so the model sees exactly which
+   *  spans the question is about; typed text follows after a blank line. */
+  const composeWithQuotes = useCallback((typed: string, list: PendingQuote[]): string => {
+    if (!list.length) return typed;
+    const block = list
+      .map((q) => q.text.split("\n").map((line) => `> ${line}`).join("\n"))
+      .join("\n\n");
+    return typed ? `${block}\n\n${typed}` : block;
+  }, []);
+
   useEffect(() => {
     if (!draftKey || draftKeyRef.current !== draftKey) return;
     setDraft(draftKey, {
       value,
       images: attachedImages.map(imageToDraftImage),
+      quotes,
     });
-  }, [attachedImages, draftKey, value]);
+  }, [attachedImages, draftKey, value, quotes]);
 
   useEffect(() => {
     const previousDraftKey = draftKeyRef.current;
@@ -544,12 +586,14 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
       setDraft(previousDraftKey, {
         value: valueRef.current,
         images: attachedImagesRef.current.map(imageToDraftImage),
+        quotes: quotesRef.current,
       });
     }
 
     const draft = draftKey ? getDraft(draftKey) : null;
     draftKeyRef.current = draftKey;
     setValue(draft?.value ?? "");
+    setQuotesSynced(draft?.quotes ?? []);
     setAtQuery(null);
     setHistoryMenuOpen(false);
     setAttachedImages((prev) => {
@@ -572,20 +616,21 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
   }, []);
 
   const handleSend = useCallback(async () => {
-    const msg = value.trim();
-    if (!msg && !attachedImages.length) return;
+    const typed = value.trim();
+    if (!typed && !attachedImages.length && !quotesRef.current.length) return;
     if (isStreaming) return;
     onAudioUnlock?.();
-    if (!attachedImages.length && msg.startsWith("/") && onBuiltinCommand) {
-      const result = await onBuiltinCommand(msg);
+    if (!attachedImages.length && typed.startsWith("/") && onBuiltinCommand) {
+      const result = await onBuiltinCommand(typed);
       if (result.handled) {
         if (!result.error) clearInput();
         return;
       }
     }
+    const msg = composeWithQuotes(typed, drainQuotes());
     onSend(msg, attachedImages.length ? attachedImages : undefined);
     clearInput();
-  }, [value, attachedImages, isStreaming, onBuiltinCommand, onSend, clearInput, onAudioUnlock]);
+  }, [value, attachedImages, isStreaming, onBuiltinCommand, onSend, clearInput, onAudioUnlock, composeWithQuotes, drainQuotes]);
 
   const slashQuery = value.startsWith("/") && !/\s/.test(value.slice(1))
     ? value.slice(1).toLowerCase()
@@ -802,11 +847,12 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
   }, []);
 
   const sendQueued = useCallback((mode: "steer" | "followup") => {
-    const msg = value.trim();
-    if (!msg && !attachedImages.length) return;
+    const typed = value.trim();
+    if (!typed && !attachedImages.length && !quotesRef.current.length) return;
     if (attachedImages.length) return;
     onAudioUnlock?.();
     const streamingBehavior = mode === "steer" ? "steer" : "followUp";
+    const msg = composeWithQuotes(typed, drainQuotes());
     if (msg.startsWith("/") && onPromptWithStreamingBehavior) {
       onPromptWithStreamingBehavior(msg, streamingBehavior, attachedImages.length ? attachedImages : undefined);
       clearInput();
@@ -818,7 +864,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
       onFollowUp(msg, attachedImages.length ? attachedImages : undefined);
     }
     clearInput();
-  }, [value, attachedImages, onPromptWithStreamingBehavior, onSteer, onFollowUp, clearInput, onAudioUnlock]);
+  }, [value, attachedImages, onPromptWithStreamingBehavior, onSteer, onFollowUp, clearInput, onAudioUnlock, composeWithQuotes, drainQuotes]);
 
   const getNextSlashIndex = useCallback((direction: "up" | "down" | "left" | "right") => {
     const lastIndex = displayedSlashCommands.length - 1;
@@ -1637,6 +1683,51 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
               </div>
             );
           })()}
+          {quotes.length > 0 && (
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 6, padding: "2px 2px 0" }}>
+              {quotes.map((q) => (
+                <span
+                  key={q.id}
+                  title={q.text}
+                  style={{
+                    display: "inline-flex",
+                    maxWidth: "100%",
+                    alignItems: "center",
+                    gap: 4,
+                    padding: "3px 4px 3px 8px",
+                    borderRadius: 999,
+                    border: "1px solid color-mix(in srgb, var(--border) 70%, transparent)",
+                    background: "var(--bg)",
+                    fontSize: 12,
+                    color: "var(--text-muted)",
+                    lineHeight: 1.4,
+                  }}
+                >
+                  <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 360 }}>
+                    ❝ {q.text}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setQuotesSynced((prev) => prev.filter((item) => item.id !== q.id))}
+                    aria-label={t("chat.quoteRemove")}
+                    title={t("chat.quoteRemove")}
+                    style={{
+                      border: "none",
+                      background: "none",
+                      color: "var(--text-dim)",
+                      cursor: "pointer",
+                      fontSize: 13,
+                      lineHeight: 1,
+                      padding: "2px 5px",
+                      borderRadius: 999,
+                    }}
+                  >
+                    ×
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
           <div
             className="sf-chat-input-box"
             style={{

@@ -6,6 +6,8 @@ import { normalizeCustomPanelLines, parseAnsiLine } from "@/lib/ansi";
 import { asBracketedPaste, toTerminalKeyData } from "@/lib/terminal-input";
 import { countToolCallBlocks, getAssistantErrorMessage, getDisplayableAssistantBlocks, splitFinalAssistantBlocks } from "@/lib/message-display";
 import { MessageView } from "./MessageView";
+import { QuoteSelectionLayer } from "./QuoteSelectionLayer";
+import type { QuoteDraft } from "@/lib/draft-store";
 import { ChatInput, type ChatInputHandle } from "./ChatInput";
 import { ChatMinimap, useMessageRefs } from "./ChatMinimap";
 import { ExtensionStatusBar } from "./ExtensionStatusBar";
@@ -194,6 +196,11 @@ export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreate
   // 稳定化 onEditContent 引用，配合 React.memo 防止历史消息重渲染
   const handleEditContent = useCallback((content: string) => {
     chatInputRef?.current?.insertIfEmpty(content);
+  }, [chatInputRef]);
+
+  // Selection-popup → composer pending-quote queue (drained on next send/steer).
+  const handleQuoteCapture = useCallback((quote: QuoteDraft) => {
+    chatInputRef?.current?.addQuote(quote);
   }, [chatInputRef]);
 
   const {
@@ -505,6 +512,7 @@ export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreate
           </div>
         </div>
         <div ref={scrollContainerRef} className="min-w-0 flex-1 overflow-x-hidden overflow-y-auto pt-4 [scrollbar-width:none]">
+          <QuoteSelectionLayer containerRef={scrollContainerRef} onQuote={handleQuoteCapture} />
           <div style={{ minWidth: 0, padding: `0 ${CHAT_COLUMN_PADDING}px` }}>
             <div style={{ width: "100%", minWidth: 0, maxWidth: 820, margin: "0 auto" }}>
               <ExtensionWidgets widgets={aboveEditorWidgets} />
@@ -588,7 +596,12 @@ export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreate
                 );
                 if (!isVisible || options.attachRef === false || currentRefIdx === undefined) return view;
                 return (
-                  <div key={`${keyPrefix}-${idx}`} ref={attachVisibleRef(idx, currentRefIdx)}>
+                  <div
+                    key={`${keyPrefix}-${idx}`}
+                    ref={attachVisibleRef(idx, currentRefIdx)}
+                    data-omp-entry-id={entryIds[idx] ?? undefined}
+                    data-omp-msg-index={idx}
+                  >
                     {view}
                   </div>
                 );

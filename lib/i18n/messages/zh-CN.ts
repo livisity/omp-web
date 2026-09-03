@@ -163,6 +163,8 @@ export const zhCNLocale: LocalePlugin = {
     "chat.processDetails": "处理详情",
     "chat.message": "条消息",
     "chat.messages": "条消息",
+    "chat.quoteAdd": "引用",
+    "chat.quoteRemove": "移除此引用",
     "chat.toolCall": "次工具调用",
     "chat.toolCalls": "次工具调用",
     "chat.collapseProcess": "收起处理详情",

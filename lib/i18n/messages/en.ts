@@ -163,6 +163,8 @@ export const enLocale: LocalePlugin = {
     "chat.processDetails": "Process details",
     "chat.message": "message",
     "chat.messages": "messages",
+    "chat.quoteAdd": "Quote",
+    "chat.quoteRemove": "Remove quote",
     "chat.toolCall": "tool call",
     "chat.toolCalls": "tool calls",
     "chat.collapseProcess": "Collapse process details",
